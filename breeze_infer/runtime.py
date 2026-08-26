@@ -19,14 +19,54 @@ def get_dist_info() -> tuple[int, int, int]:
     return rank, world_size, local_rank
 
 
+def mps_is_available() -> bool:
+    backend = getattr(torch.backends, "mps", None)
+    return bool(backend is not None and backend.is_available())
+
+
 def resolve_device(explicit_device: str | None = None) -> str:
     if explicit_device:
         return explicit_device
 
+    env_device = os.environ.get("BREEZE_DEVICE")
+    if env_device:
+        return env_device
+
     _, _, local_rank = get_dist_info()
     if torch.cuda.is_available():
         return f"cuda:{local_rank}"
+    if mps_is_available():
+        return "mps"
     return "cpu"
+
+
+_DTYPE_BY_NAME = {
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "float": torch.float32,
+}
+
+
+def resolve_dtype(device: str, explicit_dtype: str | None = None) -> torch.dtype:
+    """Pick the model dtype for a device, honouring an explicit override."""
+    name = explicit_dtype or os.environ.get("BREEZE_DTYPE")
+    if name:
+        try:
+            return _DTYPE_BY_NAME[name.strip().lower()]
+        except KeyError:
+            raise ValueError(
+                f"unsupported dtype {name!r}; expected one of "
+                f"{sorted(set(_DTYPE_BY_NAME))}"
+            ) from None
+
+    if torch.device(device).type == "cpu":
+        return torch.float32
+    return torch.bfloat16
 
 
 def set_all_seeds(seed: int) -> None:
@@ -35,6 +75,8 @@ def set_all_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if mps_is_available():
+        torch.mps.manual_seed(seed)
 
 
 def update_generation_config_for_breeze(
@@ -70,6 +112,7 @@ def load_runtime(
     *,
     device: str,
     attn_implementation: str,
+    dtype: torch.dtype | None = None,
 ) -> tuple[AutoTokenizer, BreezeForConditionalGeneration, Any]:
 
     if device.startswith("cuda"):
@@ -83,10 +126,12 @@ def load_runtime(
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
                 f"device_count={torch.cuda.device_count()}"
             ) from exc
+    if dtype is None:
+        dtype = resolve_dtype(device)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
     model = BreezeForConditionalGeneration.from_pretrained(
         ckpt_dir,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         attn_implementation=attn_implementation,
     )
     model.to(device).eval()

@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from breeze_infer.runtime import (
     load_runtime,
     resolve_device,
+    resolve_dtype,
     set_all_seeds,
     update_generation_config_for_breeze,
 )
@@ -43,6 +44,8 @@ class ApiSettings:
     fast_backbone_decode: bool
     fast_depth_decoder: bool
     fast_codec: bool
+    device: str | None = None
+    dtype: str | None = None
 
 
 _settings: ApiSettings | None = None
@@ -73,10 +76,14 @@ async def _save_upload(upload: UploadFile) -> Path:
 
 
 def _load_app(app: FastAPI, settings: ApiSettings) -> None:
+    device = resolve_device(settings.device)
+    dtype = resolve_dtype(device, settings.dtype)
+    print(f"device: {device} dtype: {dtype}", flush=True)
     tokenizer, model, audio_tokenizer = load_runtime(
         settings.model,
-        device=resolve_device(),
+        device=device,
         attn_implementation="eager",
+        dtype=dtype,
     )
     update_generation_config_for_breeze(model)
 
@@ -234,6 +241,17 @@ def main() -> None:
     parser.add_argument(
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Torch device, e.g. cuda:0, mps, cpu (default: autodetect)",
+    )
+    parser.add_argument(
+        "--dtype",
+        default=None,
+        choices=["bfloat16", "float16", "float32"],
+        help="Model dtype (default: bfloat16 on GPU, float32 on CPU)",
+    )
     args = parser.parse_args()
 
     global _settings
@@ -245,6 +263,8 @@ def main() -> None:
         fast_backbone_decode=args.fast_backbone_decode,
         fast_depth_decoder=args.fast_depth_decoder,
         fast_codec=args.fast_codec,
+        device=args.device,
+        dtype=args.dtype,
     )
 
     import uvicorn

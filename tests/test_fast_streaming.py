@@ -159,3 +159,25 @@ def test_single_cfg_merges_cond_and_uncond_in_one_batched_text_path() -> None:
 
     assert eager_branch.branch_batch_size == 2
     assert len(runtime.model.calls) == 2
+
+
+def test_fast_streaming_rejects_fast_stages_off_cuda():
+    """Fast stages need CUDA Graphs; eager streaming must still build elsewhere."""
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+            self.config = SimpleNamespace(
+                codec_config=SimpleNamespace(codebook_size=8, sampling_rate=24000),
+                vocab_size=16,
+            )
+
+    model = _Model()
+    with pytest.raises(RuntimeError, match="fast streaming stages require a CUDA"):
+        FastBreezeStreamingRuntime(
+            model, None, FastStreamingConfig(fast_all=True)
+        )
+
+    runtime = FastBreezeStreamingRuntime(model, None, FastStreamingConfig())
+    assert not runtime.fast_enabled
+    assert runtime.device.type == "cpu"

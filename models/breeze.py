@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Callable
 
 from dataclasses import dataclass
@@ -50,6 +51,13 @@ from .breeze_config import BreezeConfig, BreezeDepthDecoderConfig
 from .generation_breeze import BreezeGenerationMixin
 
 logger = logging.get_logger(__name__)
+
+
+def _flash_attn_2_available() -> bool:
+    """flash_attn is a CUDA-only wheel; report whether it can actually be used."""
+    if not torch.cuda.is_available():
+        return False
+    return importlib.util.find_spec("flash_attn") is not None
 
 
 @dataclass
@@ -974,6 +982,18 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
             )
             if text_encoder_attn_implementation is None:
                 text_encoder_attn_implementation = "flash_attention_2"
+            if (
+                text_encoder_attn_implementation == "flash_attention_2"
+                and not _flash_attn_2_available()
+            ):
+                # flash_attn only ships for CUDA; fall back to the eager kernel
+                # so the text encoder still builds on MPS/CPU.
+                logger.warning(
+                    "flash_attn is unavailable; the text encoder falls back to "
+                    "the eager attention kernel. This is expected on MPS and CPU, "
+                    "but on CUDA it is slower than installing flash_attn."
+                )
+                text_encoder_attn_implementation = "eager"
             config.text_encoder_config._attn_implementation = (
                 text_encoder_attn_implementation
             )
@@ -984,7 +1004,7 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
                 self.text_encoder = AutoModel.from_config(
                     config.text_encoder_config,
                     attn_implementation=text_encoder_attn_implementation,
-                    dtype=torch.bfloat16,
+                    dtype=torch.get_default_dtype(),
                 )
 
             text_encoder_proj_type = getattr(config, "text_encoder_proj_type", "linear")

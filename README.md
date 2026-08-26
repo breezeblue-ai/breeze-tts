@@ -39,9 +39,11 @@ Breeze TTS 2 is an open-weight text-to-speech model built for real-time interact
 
 ### Requirements
 
-- Linux and Python 3.10 or newer
-- A CUDA-capable NVIDIA GPU
+- Python 3.10 or newer
+- Linux with a CUDA-capable NVIDIA GPU for the full feature set, including the fast path
 - GPU memory: approximately 7.7 GiB for eager inference or 14.4 GiB with `--fast-all`; use a 12 GB GPU for eager or a 24 GB GPU for the fast path
+- Apple silicon macOS runs eager inference on Metal (MPS); see [Apple silicon (MPS)](#apple-silicon-mps)
+- CPU-only hosts work as a slow fallback
 - The Breeze TTS 2 checkpoint
 
 ### Installation
@@ -60,6 +62,38 @@ python -m pip install -r requirements.txt
 ```
 
 All required model components are included in the Breeze TTS 2 checkpoint.
+
+### Apple silicon (MPS)
+
+Eager streaming runs on Apple silicon GPUs through Metal. The device is detected
+automatically, so the same commands work unchanged:
+
+```bash
+python infer.py ../breeze-tts-2 \
+  --text "It is good to hear your voice again after all this time." \
+  --output outputs/voice_clone_en.wav
+```
+
+Override the detected device or dtype with `--device` and `--dtype` (the CLI and
+the API both accept them; the `BREEZE_DEVICE` and `BREEZE_DTYPE` environment
+variables do the same):
+
+```bash
+python infer.py ../breeze-tts-2 --device mps --dtype float32 --text "Hello." --output outputs/out.wav
+```
+
+The default dtype is `bfloat16` on GPU and `float32` on CPU. Notes and limits:
+
+- The `--fast-*` flags are CUDA Graph based and are rejected on MPS and CPU; run
+  eager streaming instead.
+- `flash_attn` is CUDA-only, so the text encoder falls back to the eager
+  attention kernel automatically.
+- Expect a real-time factor around 2.5 for eager streaming on an M-series
+  laptop, roughly doubling when `--cfg-scale` is above 1, which runs a second
+  CFG branch.
+- Eager streaming needs no CPU fallback, but exporting
+  `PYTORCH_ENABLE_MPS_FALLBACK=1` is a safe net if a future op lacks a Metal
+  kernel.
 
 For the tested CUDA environment, build the included Docker image:
 

@@ -12,6 +12,7 @@ import soundfile as sf
 from breeze_infer.runtime import (
     load_runtime,
     resolve_device,
+    resolve_dtype,
     set_all_seeds,
     update_generation_config_for_breeze,
 )
@@ -37,6 +38,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("output.wav"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cfg-scale", type=float, default=DEFAULT_CFG_SCALE)
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Torch device, e.g. cuda:0, mps, cpu (default: autodetect)",
+    )
+    parser.add_argument(
+        "--dtype",
+        default=None,
+        choices=["bfloat16", "float16", "float32"],
+        help="Model dtype (default: bfloat16 on GPU, float32 on CPU)",
+    )
     parser.add_argument(
         "--fast-all", action=argparse.BooleanOptionalAction, default=None
     )
@@ -67,10 +79,14 @@ def main() -> None:
     if args.ref_audio is not None and not args.ref_audio.is_file():
         raise FileNotFoundError(f"Reference audio not found: {args.ref_audio}")
 
+    device = resolve_device(args.device)
+    dtype = resolve_dtype(device, args.dtype)
+    print(f"device: {device} dtype: {dtype}")
     tokenizer, model, audio_tokenizer = load_runtime(
         args.model,
-        device=resolve_device(),
+        device=device,
         attn_implementation="eager",
+        dtype=dtype,
     )
     update_generation_config_for_breeze(model)
 
