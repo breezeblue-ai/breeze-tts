@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import tempfile
 import threading
 import uuid
@@ -22,7 +24,11 @@ from breeze_infer.runtime import (
     update_generation_config_for_breeze,
 )
 from breeze_infer.templates import get_template, prepare_inputs
-from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
+from models.fast_streaming import (
+    FastBreezeStreamingRuntime,
+    FastStreamingChunk,
+    FastStreamingConfig,
+)
 from models.warmup_profile import load_warmup_profile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +59,52 @@ def _pcm16(audio: np.ndarray) -> bytes:
     audio = np.asarray(audio, dtype=np.float32)
     audio = np.clip(audio, -1.0, 1.0)
     return (audio * 32767.0).astype("<i2", copy=False).tobytes()
+
+
+def _iter_seeded_audio_chunks(
+    runtime: FastBreezeStreamingRuntime,
+    inputs: dict[str, object],
+    *,
+    request_id: str,
+    seed: int,
+) -> Iterator[FastStreamingChunk]:
+    """Start model sampling from the request seed, after all input preparation.
+
+    The response body runs after the endpoint has returned a ``StreamingResponse``.
+    Seeding only while preparing the request leaves model sampling vulnerable to
+    lazy initialization or unrelated RNG use between preparation and iteration.
+    The API is deliberately single-request, so resetting the process generators at
+    this boundary gives each request an isolated, reproducible sampling start.
+    """
+    set_all_seeds(seed)
+    token_digest = None
+    token_frames = 0
+    if os.environ.get("BREEZE_DEBUG_TOKEN_HASH") == "1":
+        token_digest = hashlib.sha256()
+
+    def observe_token_frame(frame) -> None:
+        nonlocal token_frames
+        assert token_digest is not None
+        token_digest.update(
+            frame.detach().to(device="cpu").contiguous().numpy().tobytes()
+        )
+        token_frames += 1
+
+    try:
+        yield from runtime.iter_audio_chunks(
+            inputs,
+            request_id=request_id,
+            seed=seed,
+            token_observer=observe_token_frame if token_digest is not None else None,
+        )
+    finally:
+        if token_digest is not None:
+            print(
+                "breeze token trace: "
+                f"request_id={request_id} seed={seed} frames={token_frames} "
+                f"sha256={token_digest.hexdigest()}",
+                flush=True,
+            )
 
 
 async def _save_upload(upload: UploadFile) -> Path:
@@ -187,8 +239,11 @@ async def speech(
 
     def body() -> Iterator[bytes]:
         try:
-            for chunk in app.state.runtime.iter_audio_chunks(
-                inputs, request_id=request_id
+            for chunk in _iter_seeded_audio_chunks(
+                app.state.runtime,
+                inputs,
+                request_id=request_id,
+                seed=seed,
             ):
                 pcm = _pcm16(chunk.audio)
                 if pcm:

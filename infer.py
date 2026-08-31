@@ -127,7 +127,9 @@ def main() -> None:
         channels=1,
         subtype="PCM_16",
     ) as output_file:
-        for chunk in runtime.iter_audio_chunks(inputs, request_id="single-request"):
+        for chunk in runtime.iter_audio_chunks(
+            inputs, request_id="single-request", seed=args.seed
+        ):
             output_file.write(chunk.audio)
 
     print(f"saved {args.output}")

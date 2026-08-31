@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -744,6 +744,8 @@ class FastBreezeStreamingRuntime:
         inputs: dict[str, Any],
         *,
         request_id: str | None = None,
+        seed: int | None = None,
+        token_observer: Callable[[torch.Tensor], None] | None = None,
     ) -> Iterator[FastStreamingChunk]:
         cfg = select_fast_cfg(inputs)
         branch_batch_size = 2 if cfg.mode == "single_cfg" else 1
@@ -766,6 +768,13 @@ class FastBreezeStreamingRuntime:
             dtype=torch.long,
             device=self.device,
         )
+        # All lazy request setup must precede the reset. In particular, the
+        # first request may allocate caches and initialize the streaming codec.
+        # A request seed is a sampling contract, so those one-time operations
+        # must not be allowed to shift the backbone/depth multinomial streams.
+        if seed is not None:
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
         first_decode = True
         t_start = time.perf_counter()
         t_chunk = t_start
@@ -848,6 +857,8 @@ class FastBreezeStreamingRuntime:
                     **depth_params,
                 )
                 frame = torch.cat([token.view(1), depth_tokens[0]], dim=0)
+                if token_observer is not None:
+                    token_observer(frame)
                 if should_decode_codec_frame(frame, self.model.config):
                     chunk_buffer.append(frame.detach())
 
