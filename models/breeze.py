@@ -52,6 +52,20 @@ from .generation_breeze import BreezeGenerationMixin
 logger = logging.get_logger(__name__)
 
 
+def _resolve_text_encoder_attn_implementation(config) -> str:
+    """Honor an explicit top-level attention choice before checkpoint preference."""
+    caller_attn_implementation = getattr(config, "_attn_implementation", None)
+    if caller_attn_implementation is not None:
+        return caller_attn_implementation
+
+    preferred_attn_implementation = getattr(
+        config.text_encoder_config,
+        "preferred_attn_implementation",
+        None,
+    )
+    return preferred_attn_implementation or "flash_attention_2"
+
+
 @dataclass
 @auto_docstring(
     custom_intro="""
@@ -967,13 +981,9 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
                     f"  - [BreezeForConditionalGeneration] Text encoder feature layer idx: {self.text_encoder_feature_layer_idx}"
                 )
 
-            text_encoder_attn_implementation = getattr(
-                config.text_encoder_config,
-                "preferred_attn_implementation",
-                None,
+            text_encoder_attn_implementation = (
+                _resolve_text_encoder_attn_implementation(config)
             )
-            if text_encoder_attn_implementation is None:
-                text_encoder_attn_implementation = "flash_attention_2"
             config.text_encoder_config._attn_implementation = (
                 text_encoder_attn_implementation
             )
