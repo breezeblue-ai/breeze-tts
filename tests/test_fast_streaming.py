@@ -9,12 +9,32 @@ from breeze_infer.templates import get_template
 from models.fast_streaming import (
     FastBreezeStreamingRuntime,
     FastStreamingConfig,
+    _get_dtype,
     is_backbone_eos_token,
     is_terminal_pad_frame,
     reject_dual_cfg,
     select_fast_cfg,
     should_decode_codec_frame,
 )
+
+
+def test_runtime_dtype_follows_backbone_after_shared_lm_head_is_cast() -> None:
+    class CompositeModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lm_head = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+            self.backbone_model = torch.nn.Linear(
+                2, 2, bias=False, dtype=torch.bfloat16
+            )
+
+    model = CompositeModel()
+    assert _get_dtype(model) == torch.bfloat16
+
+    # BackboneGraph mutates the shared projection in exactly this way.
+    model.lm_head.float()
+
+    assert next(model.parameters()).dtype == torch.float32
+    assert _get_dtype(model) == torch.bfloat16
 
 
 def test_fast_streaming_defaults_to_repetition_penalty_1p1() -> None:

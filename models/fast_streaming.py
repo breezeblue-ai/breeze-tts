@@ -130,6 +130,16 @@ def _get_device(model: torch.nn.Module) -> torch.device:
 
 
 def _get_dtype(model: torch.nn.Module) -> torch.dtype:
+    # The composite model registers lm_head before the semantic backbone. CUDA
+    # graph setup intentionally casts that shared projection head to float32,
+    # so using the first composite parameter makes a later runtime select an
+    # FP32 KV cache for an otherwise BF16 backbone.
+    backbone_model = getattr(model, "backbone_model", None)
+    if isinstance(backbone_model, torch.nn.Module):
+        try:
+            return next(backbone_model.parameters()).dtype
+        except StopIteration:
+            pass
     try:
         return next(model.parameters()).dtype
     except StopIteration:
