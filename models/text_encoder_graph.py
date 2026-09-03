@@ -45,6 +45,20 @@ class TextEncoderGraphCache:
         ) * self.token_granularity
 
     @staticmethod
+    def _smallest_fitting_key(
+        keys: Sequence[tuple[int, int]],
+        *,
+        batch_size: int,
+        token_length: int,
+    ) -> tuple[int, int] | None:
+        candidates = [
+            key
+            for key in keys
+            if key[0] == batch_size and key[1] >= token_length
+        ]
+        return min(candidates, key=lambda key: key[1], default=None)
+
+    @staticmethod
     def _copy_inputs(
         segments: Sequence[torch.Tensor],
         input_ids: torch.Tensor,
@@ -73,15 +87,22 @@ class TextEncoderGraphCache:
             raise ValueError("text encoder graph does not support empty segments")
         batch_size = len(segments)
         max_length = self._bucket(max(lengths))
-        key = (batch_size, max_length)
+        requested_key = (batch_size, max_length)
 
         with self._lock:
-            record = self._records.get(key)
+            key = self._smallest_fitting_key(
+                self._records,
+                batch_size=batch_size,
+                token_length=max_length,
+            )
+            record = self._records.get(key) if key is not None else None
             if record is None:
                 if self._frozen:
                     raise RuntimeError(
-                        f"text encoder CUDA graph {key} was not declared in the warmup profile"
+                        f"text encoder CUDA graph {requested_key} has no fitting bucket "
+                        "in the warmup profile"
                     )
+                key = requested_key
                 device = segments[0].device
                 static_ids = torch.zeros(
                     (batch_size, max_length), dtype=segments[0].dtype, device=device

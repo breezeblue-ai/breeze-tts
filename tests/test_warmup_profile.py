@@ -48,7 +48,7 @@ def test_bundled_config_covers_cfg1_cfg4_and_voice_direction() -> None:
     assert cfg_guided_text_lengths == list(range(32, 513, 32))
     # ref_edit_tata merges the positive and negative branches' two text
     # segments each, so fast CFG-4 voice direction reaches batch size 4.
-    assert voice_direction_text_lengths == [64, 96, 128]
+    assert voice_direction_text_lengths == [32, 64, 96, 128, 160, 256]
 
 
 def test_config_requires_decode_graph_for_each_cfg_shape() -> None:
