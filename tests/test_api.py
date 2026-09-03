@@ -6,6 +6,7 @@ import numpy as np
 
 from breeze_infer.api import (
     DEFAULT_CFG_SCALE,
+    _iter_seeded_audio_chunks,
     _pcm16,
     app,
     speech,
@@ -55,3 +56,31 @@ def test_pcm16_clips_and_encodes_little_endian() -> None:
     encoded = _pcm16(np.array([-2.0, 0.0, 2.0], dtype=np.float32))
 
     assert np.frombuffer(encoded, dtype="<i2").tolist() == [-32767, 0, 32767]
+
+
+def test_streaming_reseeds_immediately_before_model_sampling(monkeypatch) -> None:
+    events = []
+
+    class Runtime:
+        def iter_audio_chunks(
+            self, inputs, *, request_id, seed, token_observer
+        ):
+            events.append(("sample", inputs, request_id, seed, token_observer))
+            yield "chunk"
+
+    monkeypatch.setattr(
+        "breeze_infer.api.set_all_seeds",
+        lambda seed: events.append(("seed", seed)),
+    )
+
+    chunks = list(
+        _iter_seeded_audio_chunks(
+            Runtime(), {"input_ids": "prepared"}, request_id="request-1", seed=43
+        )
+    )
+
+    assert chunks == ["chunk"]
+    assert events == [
+        ("seed", 43),
+        ("sample", {"input_ids": "prepared"}, "request-1", 43, None),
+    ]
