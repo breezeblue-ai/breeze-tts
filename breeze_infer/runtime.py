@@ -83,7 +83,10 @@ def load_runtime(
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
                 f"device_count={torch.cuda.device_count()}"
             ) from exc
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+    tokenizer = AutoTokenizer.from_pretrained(
+        ckpt_dir,
+        fix_mistral_regex=False,
+    )
     model = BreezeForConditionalGeneration.from_pretrained(
         ckpt_dir,
         dtype=torch.bfloat16,
