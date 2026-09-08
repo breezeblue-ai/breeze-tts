@@ -106,11 +106,21 @@ def _ref_edit_tata_dual_branches(request: Request) -> dict[str, list[Segment]]:
 
 
 TEMPLATES: dict[str, TemplateSpec] = {
+    "tts_plain": TemplateSpec(
+        name="tts_plain",
+        required_fields=("text",),
+        build_segments=_tts_plain_segments,
+    ),
     "tts_instruction": TemplateSpec(
         name="tts_instruction",
         required_fields=("text", "instruction"),
         build_segments=_tts_instruction_segments,
         build_negative_segments=_tts_instruction_negative_segments,
+    ),
+    "ref_clone_tata": TemplateSpec(
+        name="ref_clone_tata",
+        required_fields=("text", "ref_audio_path", "ref_text"),
+        build_segments=_ref_clone_tata_segments,
     ),
     "ref_edit_tata": TemplateSpec(
         name="ref_edit_tata",
@@ -120,6 +130,19 @@ TEMPLATES: dict[str, TemplateSpec] = {
         build_dual_branches=_ref_edit_tata_dual_branches,
     ),
 }
+
+
+def select_template_name(request: Request) -> str:
+    has_ref_audio = bool(request.get("ref_audio_path"))
+    has_ref_text = bool(request.get("ref_text"))
+    if has_ref_audio != has_ref_text:
+        raise ValueError("ref_audio_path and ref_text must be provided together")
+    has_reference = has_ref_audio
+    instruction = request.get("instruction")
+    has_instruction = bool(isinstance(instruction, str) and instruction.strip())
+    if has_reference:
+        return "ref_edit_tata" if has_instruction else "ref_clone_tata"
+    return "tts_instruction" if has_instruction else "tts_plain"
 
 
 def get_template(name: str) -> TemplateSpec:

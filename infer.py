@@ -15,7 +15,7 @@ from breeze_infer.runtime import (
     set_all_seeds,
     update_generation_config_for_breeze,
 )
-from breeze_infer.templates import get_template, prepare_inputs
+from breeze_infer.templates import get_template, prepare_inputs, select_template_name
 from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
 from models.warmup_profile import load_warmup_profile
 
@@ -31,7 +31,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate one WAV with Breeze TTS 2")
     parser.add_argument("model", type=Path)
     parser.add_argument("--text", required=True)
-    parser.add_argument("--instruction", default="Speak clearly and naturally.")
+    parser.add_argument("--instruction")
     parser.add_argument("--ref-audio", type=Path)
     parser.add_argument("--ref-text")
     parser.add_argument("--output", type=Path, default=Path("output.wav"))
@@ -95,17 +95,18 @@ def main() -> None:
         manifest = runtime.warmup_from_profile(profile)
         print(f"fast warmup: {manifest['total_elapsed_ms']:.2f} ms")
 
+    instruction = args.instruction.strip() if args.instruction else None
     request = {
         "id": "single-request",
         "text": args.text,
-        "instruction": args.instruction,
         "speaker": "S0",
     }
-    template_name = "tts_instruction"
+    if instruction:
+        request["instruction"] = instruction
     if args.ref_audio is not None:
         request["ref_audio_path"] = str(args.ref_audio)
         request["ref_text"] = args.ref_text.strip()
-        template_name = "ref_edit_tata"
+    template_name = select_template_name(request)
 
     set_all_seeds(args.seed)
     inputs = prepare_inputs(

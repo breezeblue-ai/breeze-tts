@@ -97,7 +97,11 @@ python infer.py ../breeze-tts-2 \
   --output outputs/voice_clone_zh.wav
 ```
 
-Reference audio should contain clean speech with minimal background noise.
+Reference audio should contain clean, non-looping speech with minimal background
+noise. `--ref-text` should match the complete spoken content of the reference
+audio; if speech is repeated in the audio, include those repetitions in the
+transcript. Voice Clone does not use an instruction. Adding `--instruction`
+selects Voice Direction instead.
 
 ### 🎨 Voice Design
 

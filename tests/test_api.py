@@ -47,6 +47,12 @@ def test_api_cfg_defaults_to_one() -> None:
     assert cfg_parameter.default.default == 1.0
 
 
+def test_api_instruction_defaults_to_none() -> None:
+    instruction_parameter = inspect.signature(speech).parameters["instruction"]
+
+    assert instruction_parameter.default.default is None
+
+
 def test_cli_and_api_support_1500_generated_tokens() -> None:
     assert CLI_MAX_NEW_TOKENS == API_MAX_NEW_TOKENS == 1500
     assert CLI_MAX_SEQ_LEN == API_MAX_SEQ_LEN == 2048
