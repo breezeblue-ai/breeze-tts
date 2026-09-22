@@ -45,6 +45,8 @@ MAX_SEQ_LEN = 2048
 REPETITION_PENALTY = 1.1
 OPTIONAL_AUDIO_FILE = File(None)
 MAX_BATCH_TEXTS = 128
+MODEL_CONFIG_FILE = "config.json"
+MODEL_INDEX_FILE = "model.safetensors.index.json"
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class ApiSettings:
     fast_backbone_decode: bool
     fast_depth_decoder: bool
     fast_codec: bool
+    model_info: dict[str, float | str | int]
 
 
 _settings: ApiSettings | None = None
@@ -97,6 +100,39 @@ def resolve_model_dir(model: str, revision: str | None = None) -> Path:
             f"Hugging Face repo id such as 'BreezeBlue/breeze-tts-2': {exc}"
         ) from exc
     return Path(snapshot_download(repo_id=model, revision=revision))
+
+
+def read_frame_rate(model_dir: Path) -> float:
+    """Return the codec frame rate from ``codec_config._frame_rate``."""
+    config_path = model_dir / MODEL_CONFIG_FILE
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    try:
+        return float(config["codec_config"]["_frame_rate"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"{config_path} has no codec_config._frame_rate") from exc
+
+
+def compute_model_digest(model_dir: Path) -> str:
+    """Hash the checkpoint's config and safetensors index, never the weights.
+
+    The digest depends only on file contents, so the same checkpoint yields the
+    same value from a local directory or any Hugging Face cache location.
+    """
+    digest = hashlib.sha256()
+    digest.update((model_dir / MODEL_CONFIG_FILE).read_bytes())
+    index_path = model_dir / MODEL_INDEX_FILE
+    if index_path.is_file():
+        digest.update(index_path.read_bytes())
+    return digest.hexdigest()
+
+
+def build_model_info(model_dir: Path) -> dict[str, float | str | int]:
+    return {
+        "frame_rate": read_frame_rate(model_dir),
+        "model_digest": compute_model_digest(model_dir),
+        "max_new_tokens": MAX_NEW_TOKENS,
+        "max_batch_texts": MAX_BATCH_TEXTS,
+    }
 
 
 def _pcm16(audio: np.ndarray) -> bytes:
@@ -218,6 +254,13 @@ def health() -> JSONResponse:
     if not hasattr(app.state, "runtime"):
         return JSONResponse({"status": "loading"}, status_code=503)
     return JSONResponse({"status": "ok", "sample_rate": app.state.runtime.sample_rate})
+
+
+@app.get("/v1/model")
+def model_info() -> JSONResponse:
+    if _settings is None:
+        raise HTTPException(status_code=503, detail="API settings are not initialized.")
+    return JSONResponse(_settings.model_info)
 
 
 @app.post("/v1/audio/speech")
@@ -512,6 +555,7 @@ def main() -> None:
         fast_backbone_decode=args.fast_backbone_decode,
         fast_depth_decoder=args.fast_depth_decoder,
         fast_codec=args.fast_codec,
+        model_info=build_model_info(model_dir),
     )
 
     import uvicorn

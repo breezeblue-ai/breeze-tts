@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -36,6 +37,7 @@ def test_api_exposes_only_health_and_streaming_speech() -> None:
     assert "/health" in paths
     assert "/v1/audio/speech" in paths
     assert "/v1/audio/speech/batch" in paths
+    assert "/v1/model" in paths
     assert "/api/ref-audio-codes" not in paths
 
 
@@ -332,3 +334,73 @@ def test_main_reports_invalid_model_as_usage_error(
 
     assert exc_info.value.code == 2
     assert "neither an existing local directory" in capsys.readouterr().err
+
+
+MODEL_CONFIG = {"codec_config": {"_frame_rate": 12.5}, "model_type": "breeze"}
+MODEL_INDEX = {"weight_map": {"lm_head.weight": "model-00001-of-00001.safetensors"}}
+
+
+def _write_checkpoint(model_dir, *, index: bool = True, config=None):
+    model_dir.mkdir(parents=True, exist_ok=True)
+    config_bytes = json.dumps(config or MODEL_CONFIG).encode()
+    index_bytes = json.dumps(MODEL_INDEX).encode()
+    (model_dir / "config.json").write_bytes(config_bytes)
+    if index:
+        (model_dir / "model.safetensors.index.json").write_bytes(index_bytes)
+    (model_dir / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+    return config_bytes, index_bytes if index else b""
+
+
+def test_read_frame_rate(tmp_path) -> None:
+    _write_checkpoint(tmp_path)
+
+    assert api.read_frame_rate(tmp_path) == 12.5
+
+
+def test_read_frame_rate_requires_codec_frame_rate(tmp_path) -> None:
+    _write_checkpoint(tmp_path, config={"codec_config": {}})
+
+    with pytest.raises(ValueError, match="_frame_rate"):
+        api.read_frame_rate(tmp_path)
+
+
+@pytest.mark.parametrize("index", [True, False])
+def test_model_digest_hashes_config_then_index(tmp_path, index) -> None:
+    config_bytes, index_bytes = _write_checkpoint(tmp_path, index=index)
+
+    expected = hashlib.sha256(config_bytes + index_bytes).hexdigest()
+    assert api.compute_model_digest(tmp_path) == expected
+
+
+def test_model_digest_ignores_location_and_weights(tmp_path) -> None:
+    _write_checkpoint(tmp_path / "a")
+    _write_checkpoint(tmp_path / "b")
+    (tmp_path / "b" / "model-00001-of-00001.safetensors").write_bytes(b"other")
+
+    digest = api.compute_model_digest(tmp_path / "a")
+    assert digest == api.compute_model_digest(tmp_path / "b")
+
+
+def test_model_route_reports_checkpoint_facts(tmp_path, monkeypatch) -> None:
+    _write_checkpoint(tmp_path)
+    settings = api.ApiSettings(
+        model=tmp_path,
+        fast_all=None,
+        fast_text_encoder=False,
+        fast_backbone_prefill=False,
+        fast_backbone_decode=False,
+        fast_depth_decoder=False,
+        fast_codec=False,
+        model_info=api.build_model_info(tmp_path),
+    )
+    monkeypatch.setattr(api, "_settings", settings)
+
+    response = TestClient(app).get("/v1/model")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "frame_rate": 12.5,
+        "model_digest": api.compute_model_digest(tmp_path),
+        "max_new_tokens": 1500,
+        "max_batch_texts": 128,
+    }
