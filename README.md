@@ -164,6 +164,38 @@ curl -X POST http://127.0.0.1:7860/v1/audio/speech \
 
 The response is streaming mono 24 kHz signed 16-bit little-endian PCM. Start the API with `--fast-all` to enable the fast path.
 
+The model argument is either a local checkpoint directory or a Hugging Face repo id. Repo ids are downloaded into the standard Hugging Face cache; pass `--revision` to pin a branch, tag, or commit (ignored for local directories):
+
+```bash
+python -m breeze_infer.api BreezeBlue/breeze-tts-2 --revision main --host 0.0.0.0 --port 7860
+```
+
+### 📦 Batch API
+
+For offline synthesis, send many texts in one request. Decoding one sequence at a time is memory-bandwidth bound, so a batch finishes much faster than the same texts sent one by one:
+
+```bash
+curl -X POST http://127.0.0.1:7860/v1/audio/speech/batch \
+  -F 'texts=["The first sentence.", "The second sentence."]' \
+  -F "instruction=A calm, clear narrator." \
+  -F "seed=42" \
+  -F "max_new_tokens=600" \
+  --dump-header headers.txt \
+  --output batch.pcm
+```
+
+`texts` is a JSON array of up to 128 non-empty strings. `instruction`, `cfg_scale`, `ref_audio` with `ref_text`, and `seed` behave as in `/v1/audio/speech` and apply to every text. `max_new_tokens` is clamped to the server limit of 1500. Batches use eager generation and share the single inference slot with streaming requests; a request made while another is running returns `409`.
+
+The response body is the mono 24 kHz s16le PCM of every segment concatenated in request order. `X-Segment-Bytes` lists each segment's byte length, comma separated, so the body can be split back into segments.
+
+`GET /v1/model` reports the loaded checkpoint and the server limits:
+
+```json
+{"frame_rate": 12.5, "model_digest": "<sha256>", "max_new_tokens": 1500, "max_batch_texts": 128}
+```
+
+`frame_rate` is the codec frame rate (tokens per second of audio), useful for sizing `max_new_tokens`. `model_digest` is a SHA-256 over the checkpoint's `config.json` and `model.safetensors.index.json`, so it identifies the checkpoint regardless of where it is stored.
+
 ### ⚡ Fast Inference Options
 
 Both the CLI and API use eager streaming by default and skip graph warmup. Pass `--fast-all` to enable the best configuration for every inference stage when the additional cold-start time is acceptable. Each stage can also be controlled independently:
