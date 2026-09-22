@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -59,6 +60,43 @@ class ApiSettings:
 
 _settings: ApiSettings | None = None
 _request_lock = threading.Lock()
+logger = logging.getLogger(__name__)
+
+
+class ModelResolutionError(ValueError):
+    """The model argument is neither a local directory nor a Hub repo id."""
+
+
+def resolve_model_dir(model: str, revision: str | None = None) -> Path:
+    """Return a local checkpoint directory for a local path or Hub repo id.
+
+    Repo ids are fetched with ``huggingface_hub.snapshot_download`` into the
+    standard Hugging Face cache, so an already downloaded revision is reused.
+    """
+    if not model.strip():
+        raise ModelResolutionError("The model argument is empty.")
+    local_dir = Path(model).expanduser()
+    if local_dir.is_dir():
+        if revision is not None:
+            logger.warning(
+                "Ignoring --revision %r: %s is a local directory.", revision, local_dir
+            )
+        return local_dir
+
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import HFValidationError
+    from huggingface_hub.utils import validate_repo_id
+
+    try:
+        if model.count("/") != 1:
+            raise HFValidationError("expected '<namespace>/<name>'")
+        validate_repo_id(model)
+    except HFValidationError as exc:
+        raise ModelResolutionError(
+            f"{model!r} is neither an existing local directory nor a valid "
+            f"Hugging Face repo id such as 'BreezeBlue/breeze-tts-2': {exc}"
+        ) from exc
+    return Path(snapshot_download(repo_id=model, revision=revision))
 
 
 def _pcm16(audio: np.ndarray) -> bytes:
@@ -432,7 +470,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Serve Breeze TTS 2 streaming inference"
     )
-    parser.add_argument("model", type=Path)
+    parser.add_argument(
+        "model", help="Local checkpoint directory or Hugging Face repo id"
+    )
+    parser.add_argument(
+        "--revision",
+        help="Hugging Face revision for a repo id; ignored for local directories",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument(
@@ -454,10 +498,14 @@ def main() -> None:
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
     args = parser.parse_args()
+    try:
+        model_dir = resolve_model_dir(args.model, args.revision)
+    except ModelResolutionError as exc:
+        parser.error(str(exc))
 
     global _settings
     _settings = ApiSettings(
-        model=args.model,
+        model=model_dir,
         fast_all=args.fast_all,
         fast_text_encoder=args.fast_text_encoder,
         fast_backbone_prefill=args.fast_backbone_prefill,

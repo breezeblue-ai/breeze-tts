@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from types import SimpleNamespace
 
+import huggingface_hub
 import numpy as np
 import pytest
 import torch
@@ -270,3 +272,63 @@ def test_batch_rejects_mismatched_segment_count(batch_client) -> None:
     with pytest.raises(RuntimeError, match="Batch size mismatch"):
         _post_batch(batch_client, ["one", "two"])
     assert not api._request_lock.locked()
+
+
+@pytest.fixture
+def no_download(monkeypatch):
+    def fail(**kwargs):
+        raise AssertionError(f"snapshot_download must not be called: {kwargs}")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fail)
+
+
+def test_resolve_model_dir_accepts_local_directory(tmp_path, no_download) -> None:
+    assert api.resolve_model_dir(str(tmp_path)) == tmp_path
+
+
+def test_resolve_model_dir_ignores_revision_for_local_directory(
+    tmp_path, caplog, no_download
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=api.__name__):
+        assert api.resolve_model_dir(str(tmp_path), "main") == tmp_path
+
+    assert "Ignoring --revision" in caplog.text
+
+
+def test_resolve_model_dir_downloads_repo_id(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    def fake_snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path / "snapshot")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.chdir(tmp_path)
+
+    resolved = api.resolve_model_dir("BreezeBlue/breeze-tts-2", "abc123")
+
+    assert resolved == tmp_path / "snapshot"
+    assert calls == [{"repo_id": "BreezeBlue/breeze-tts-2", "revision": "abc123"}]
+
+
+@pytest.mark.parametrize("model", ["", "/no/such/dir", "not a repo", "a/b/c"])
+def test_resolve_model_dir_rejects_invalid_model(
+    tmp_path, monkeypatch, model, no_download
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(api.ModelResolutionError):
+        api.resolve_model_dir(model)
+
+
+def test_main_reports_invalid_model_as_usage_error(
+    tmp_path, monkeypatch, capsys, no_download
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", ["breeze_infer.api", "missing-dir"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        api.main()
+
+    assert exc_info.value.code == 2
+    assert "neither an existing local directory" in capsys.readouterr().err
