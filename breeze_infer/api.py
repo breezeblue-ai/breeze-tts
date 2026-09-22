@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import tempfile
 import threading
@@ -14,8 +15,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
+import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from transformers.generation.logits_process import LogitsProcessorList
 
 from breeze_infer.runtime import (
     load_runtime,
@@ -29,6 +33,7 @@ from models.fast_streaming import (
     FastStreamingChunk,
     FastStreamingConfig,
 )
+from models.logits_process import GeneratedTokenRepetitionPenaltyLogitsProcessor
 from models.warmup_profile import load_warmup_profile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +43,7 @@ MAX_NEW_TOKENS = 1500
 MAX_SEQ_LEN = 2048
 REPETITION_PENALTY = 1.1
 OPTIONAL_AUDIO_FILE = File(None)
+MAX_BATCH_TEXTS = 128
 
 
 @dataclass(frozen=True)
@@ -258,6 +264,163 @@ async def speech(
         body(),
         media_type="audio/pcm",
         headers={
+            "X-Sample-Rate": str(app.state.runtime.sample_rate),
+            "X-Sample-Format": "s16le",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def _parse_batch_texts(texts: str) -> list[str]:
+    try:
+        parsed = json.loads(texts)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"texts must be a JSON array of strings: {exc}"
+        ) from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise HTTPException(
+            status_code=400, detail="texts must be a non-empty JSON array."
+        )
+    if len(parsed) > MAX_BATCH_TEXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"texts has {len(parsed)} entries; the limit is {MAX_BATCH_TEXTS}.",
+        )
+    if not all(isinstance(item, str) and item.strip() for item in parsed):
+        raise HTTPException(
+            status_code=400, detail="Every entry in texts must be a non-empty string."
+        )
+    return parsed
+
+
+def _generate_batch_pcm(
+    texts: list[str],
+    *,
+    instruction: str | None,
+    cfg_scale: float,
+    seed: int,
+    reference_path: Path | None,
+    ref_text: str,
+    max_new_tokens: int,
+) -> list[bytes]:
+    """Synthesize every text in one batched eager ``generate`` call.
+
+    The fast streaming runtime is single-request: its CUDA Graph batch dimension
+    is taken by CFG, so it cannot batch texts. Eager generation is slower for a
+    single sequence but accepts a real batch, which wins for offline synthesis
+    because batch-1 decode re-reads every weight for each frame.
+    """
+    requests = []
+    for index, text in enumerate(texts):
+        request = {
+            "id": f"batch-{index}",
+            "text": text,
+            "speaker": "S0",
+        }
+        if instruction:
+            request["instruction"] = instruction
+        if reference_path is not None:
+            request["ref_audio_path"] = str(reference_path)
+            request["ref_text"] = ref_text
+        requests.append(request)
+    template_name = select_template_name(requests[0])
+
+    set_all_seeds(seed)
+    inputs = prepare_inputs(
+        app.state.tokenizer,
+        app.state.audio_tokenizer,
+        app.state.model,
+        requests,
+        get_template(template_name),
+        guidance_scale=cfg_scale,
+        guidance_scale_ref=None,
+        guidance_scale_ins=None,
+    )
+
+    logits_processor = LogitsProcessorList(
+        [GeneratedTokenRepetitionPenaltyLogitsProcessor(REPETITION_PENALTY)]
+    )
+
+    set_all_seeds(seed)
+    with torch.no_grad():
+        audio = app.state.model.generate(
+            **inputs,
+            output_audio=True,
+            audio_tokenizer=app.state.audio_tokenizer,
+            logits_processor=logits_processor,
+            max_new_tokens=max_new_tokens,
+        )
+
+    if len(audio) != len(texts):
+        raise RuntimeError(
+            f"Batch size mismatch: sent {len(texts)} texts, "
+            f"got {len(audio)} audio segments."
+        )
+    return [
+        _pcm16(segment.detach().float().cpu().numpy().reshape(-1)) for segment in audio
+    ]
+
+
+@app.post("/v1/audio/speech/batch")
+async def speech_batch(
+    texts: str = Form(...),
+    instruction: str | None = Form(None),
+    cfg_scale: float = Form(DEFAULT_CFG_SCALE),
+    ref_audio: UploadFile | None = OPTIONAL_AUDIO_FILE,
+    ref_text: str = Form(""),
+    seed: int = Form(42),
+    max_new_tokens: int = Form(MAX_NEW_TOKENS),
+) -> Response:
+    """Synthesize a JSON array of texts in one batch.
+
+    The body is the concatenated s16le PCM of every segment in request order;
+    ``X-Segment-Bytes`` lists each segment's byte length so callers can split it.
+    """
+    if not _request_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409, detail="An inference request is already running."
+        )
+
+    reference_path: Path | None = None
+    try:
+        parsed_texts = _parse_batch_texts(texts)
+        if not np.isfinite(cfg_scale) or cfg_scale <= 0:
+            raise HTTPException(
+                status_code=400, detail="cfg_scale must be greater than 0."
+            )
+        max_new_tokens = max(1, min(max_new_tokens, MAX_NEW_TOKENS))
+        ref_text = ref_text.strip()
+        has_reference = ref_audio is not None and bool(ref_audio.filename)
+        if has_reference != bool(ref_text):
+            raise HTTPException(
+                status_code=400,
+                detail="ref_audio and ref_text must be provided together or both omitted.",
+            )
+        if has_reference:
+            assert ref_audio is not None
+            reference_path = await _save_upload(ref_audio)
+
+        segments = await run_in_threadpool(
+            _generate_batch_pcm,
+            parsed_texts,
+            instruction=instruction.strip() if instruction else None,
+            cfg_scale=cfg_scale,
+            seed=seed,
+            reference_path=reference_path,
+            ref_text=ref_text,
+            max_new_tokens=max_new_tokens,
+        )
+    finally:
+        if reference_path is not None:
+            reference_path.unlink(missing_ok=True)
+        _request_lock.release()
+
+    return Response(
+        content=b"".join(segments),
+        media_type="application/octet-stream",
+        headers={
+            "X-Segment-Bytes": ",".join(str(len(segment)) for segment in segments),
             "X-Sample-Rate": str(app.state.runtime.sample_rate),
             "X-Sample-Format": "s16le",
             "Cache-Control": "no-store",
