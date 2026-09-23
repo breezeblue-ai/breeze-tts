@@ -108,9 +108,15 @@ class FakeBatchModel:
     def __init__(self, lengths: list[int] | None = None) -> None:
         self.lengths = lengths
         self.calls = []
+        self.head = torch.nn.Linear(2, 2)
+        self.weights_during_generate = []
+        self.error = None
 
     def generate(self, **kwargs):
         self.calls.append(kwargs)
+        self.weights_during_generate.append(self.head.weight)
+        if self.error is not None:
+            raise self.error
         lengths = self.lengths or [2] * kwargs["batch_size"]
         return [torch.full((1, length), 0.5) for length in lengths]
 
@@ -132,7 +138,15 @@ def batch_client(monkeypatch):
     monkeypatch.setattr(
         app.state, "runtime", SimpleNamespace(sample_rate=24000), raising=False
     )
+    batch_weight = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+    monkeypatch.setattr(
+        app.state,
+        "batch_head_weights",
+        {model.head: batch_weight},
+        raising=False,
+    )
     client = TestClient(app)
+    client.batch_weight = batch_weight
     client.model = model
     client.prepared = prepared
     return client
@@ -235,6 +249,53 @@ def test_batch_generates_eagerly_with_repetition_penalty(batch_client) -> None:
     assert call["max_new_tokens"] == api.MAX_NEW_TOKENS
     (processor,) = call["logits_processor"]
     assert isinstance(processor, api.GeneratedTokenRepetitionPenaltyLogitsProcessor)
+
+
+def test_batch_generates_with_checkpoint_head_weights(batch_client) -> None:
+    head = batch_client.model.head
+    original = head.weight
+
+    response = _post_batch(batch_client, ["one", "two"])
+
+    assert response.status_code == 200
+    assert batch_client.model.weights_during_generate == [batch_client.batch_weight]
+    assert head.weight is original
+
+
+def test_batch_restores_head_weights_when_generate_fails(batch_client) -> None:
+    head = batch_client.model.head
+    original = head.weight
+    batch_client.model.error = RuntimeError("generation failed")
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        _post_batch(batch_client, ["one"])
+
+    assert batch_client.model.weights_during_generate == [batch_client.batch_weight]
+    assert head.weight is original
+    assert not api._request_lock.locked()
+
+
+def test_checkpoint_head_weights_survive_in_place_head_casts() -> None:
+    model = SimpleNamespace(
+        lm_head=torch.nn.Linear(2, 3, bias=False).to(torch.bfloat16),
+        depth_decoder=SimpleNamespace(
+            codebooks_head=torch.nn.Linear(2, 3, bias=False).to(torch.bfloat16)
+        ),
+    )
+    expected = model.lm_head.weight.detach().clone()
+
+    weights = api._checkpoint_head_weights(model)
+    model.lm_head.float()
+    model.depth_decoder.codebooks_head.weight.data = (
+        model.depth_decoder.codebooks_head.weight.data.float()
+    )
+
+    assert set(weights) == {model.lm_head, model.depth_decoder.codebooks_head}
+    assert all(weight.dtype == torch.bfloat16 for weight in weights.values())
+    assert torch.equal(weights[model.lm_head], expected)
+    with api._swapped_weights(weights):
+        assert model.lm_head.weight.dtype == torch.bfloat16
+    assert model.lm_head.weight.dtype == torch.float32
 
 
 @pytest.mark.parametrize(

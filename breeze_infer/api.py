@@ -11,7 +11,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -204,6 +204,34 @@ async def _save_upload(upload: UploadFile) -> Path:
     return path
 
 
+def _checkpoint_head_weights(model) -> dict[torch.nn.Module, torch.nn.Parameter]:
+    """Snapshot the projection heads before streaming graph setup casts them.
+
+    Streaming graph setup casts ``lm_head`` and the depth decoder's codebook head
+    to float32 in place. Eager batch generation runs the heads on bfloat16 hidden
+    states, so it swaps these checkpoint-dtype copies in for each call.
+    """
+    heads = (model.lm_head, model.depth_decoder.codebooks_head)
+    return {
+        head: torch.nn.Parameter(head.weight.detach().clone(), requires_grad=False)
+        for head in heads
+    }
+
+
+@contextmanager
+def _swapped_weights(
+    weights: dict[torch.nn.Module, torch.nn.Parameter],
+) -> Iterator[None]:
+    originals = {module: module.weight for module in weights}
+    for module, weight in weights.items():
+        module.weight = weight
+    try:
+        yield
+    finally:
+        for module, weight in originals.items():
+            module.weight = weight
+
+
 def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     tokenizer, model, audio_tokenizer = load_runtime(
         settings.model,
@@ -211,6 +239,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
         attn_implementation="eager",
     )
     update_generation_config_for_breeze(model)
+    batch_head_weights = _checkpoint_head_weights(model)
 
     config = FastStreamingConfig(
         max_new_tokens=MAX_NEW_TOKENS,
@@ -236,6 +265,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     app.state.model = model
     app.state.audio_tokenizer = audio_tokenizer
     app.state.runtime = runtime
+    app.state.batch_head_weights = batch_head_weights
 
 
 @asynccontextmanager
@@ -424,7 +454,7 @@ def _generate_batch_pcm(
     )
 
     set_all_seeds(seed)
-    with torch.no_grad():
+    with torch.inference_mode(), _swapped_weights(app.state.batch_head_weights):
         audio = app.state.model.generate(
             **inputs,
             output_audio=True,
