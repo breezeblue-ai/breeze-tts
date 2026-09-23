@@ -22,6 +22,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers.generation.logits_process import LogitsProcessorList
 
+from breeze_infer.batch import BatchDepthDecoder
 from breeze_infer.runtime import (
     load_runtime,
     resolve_device,
@@ -240,6 +241,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     )
     update_generation_config_for_breeze(model)
     batch_head_weights = _checkpoint_head_weights(model)
+    batch_depth_decoder = BatchDepthDecoder(model, max_batch_size=MAX_BATCH_TEXTS)
 
     config = FastStreamingConfig(
         max_new_tokens=MAX_NEW_TOKENS,
@@ -266,6 +268,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     app.state.audio_tokenizer = audio_tokenizer
     app.state.runtime = runtime
     app.state.batch_head_weights = batch_head_weights
+    app.state.batch_depth_decoder = batch_depth_decoder
 
 
 @asynccontextmanager
@@ -454,7 +457,11 @@ def _generate_batch_pcm(
     )
 
     set_all_seeds(seed)
-    with torch.inference_mode(), _swapped_weights(app.state.batch_head_weights):
+    with (
+        torch.inference_mode(),
+        _swapped_weights(app.state.batch_head_weights),
+        app.state.batch_depth_decoder.bound(app.state.model),
+    ):
         audio = app.state.model.generate(
             **inputs,
             output_audio=True,
