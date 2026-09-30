@@ -8,14 +8,17 @@ import os
 import tempfile
 import threading
 import uuid
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Generator, Iterator
+from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import anyio
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
+from starlette.types import Receive, Scope, Send
 
 from breeze_infer.runtime import (
     load_runtime,
@@ -53,6 +56,36 @@ class ApiSettings:
 
 _settings: ApiSettings | None = None
 _request_lock = threading.Lock()
+
+
+class _InferenceStreamingResponse(StreamingResponse):
+    """Own the inference lifetime, including disconnects before the first chunk."""
+
+    def __init__(
+        self,
+        stream: Generator[bytes, None, None],
+        cleanup: Callable[[], None],
+        **kwargs,
+    ) -> None:
+        super().__init__(stream, **kwargs)
+        self._stream = stream
+        self._cleanup = cleanup
+
+    def _close(self) -> None:
+        try:
+            self._stream.close()
+        finally:
+            self._cleanup()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Starlette's threadpool iteration waits for an in-flight next() to
+            # finish before cancellation unwinds here. Close only then, and keep
+            # cleanup shielded so the model is idle before another request enters.
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(self._close)
 
 
 def _pcm16(audio: np.ndarray) -> bytes:
@@ -109,18 +142,20 @@ def _iter_seeded_audio_chunks(
 
 async def _save_upload(upload: UploadFile) -> Path:
     suffix = Path(upload.filename or "reference.wav").suffix or ".wav"
-    with tempfile.NamedTemporaryFile(
-        prefix="breeze_ref_", suffix=suffix, delete=False
-    ) as temporary:
-        path = Path(temporary.name)
-        try:
+    path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="breeze_ref_", suffix=suffix, delete=False
+        ) as temporary:
+            path = Path(temporary.name)
             payload = await upload.read()
             if not payload:
                 raise HTTPException(status_code=400, detail="Reference audio is empty.")
             temporary.write(payload)
-        except Exception:
+    except BaseException:
+        if path is not None:
             path.unlink(missing_ok=True)
-            raise
+        raise
     return path
 
 
@@ -191,6 +226,14 @@ async def speech(
         )
 
     reference_path: Path | None = None
+
+    def cleanup() -> None:
+        try:
+            if reference_path is not None:
+                reference_path.unlink(missing_ok=True)
+        finally:
+            _request_lock.release()
+
     try:
         if not np.isfinite(cfg_scale) or cfg_scale <= 0:
             raise HTTPException(
@@ -232,30 +275,29 @@ async def speech(
             guidance_scale_ref=None,
             guidance_scale_ins=None,
         )
-    except Exception:
-        if reference_path is not None:
-            reference_path.unlink(missing_ok=True)
-        _request_lock.release()
+    except BaseException:
+        cleanup()
         raise
 
-    def body() -> Iterator[bytes]:
-        try:
-            for chunk in _iter_seeded_audio_chunks(
+    def body() -> Generator[bytes, None, None]:
+        # Explicitly propagate close() through the sampling iterator to release
+        # the runtime's per-request codec state, without relying on GC.
+        with closing(
+            _iter_seeded_audio_chunks(
                 app.state.runtime,
                 inputs,
                 request_id=request_id,
                 seed=seed,
-            ):
+            )
+        ) as chunks:
+            for chunk in chunks:
                 pcm = _pcm16(chunk.audio)
                 if pcm:
                     yield pcm
-        finally:
-            if reference_path is not None:
-                reference_path.unlink(missing_ok=True)
-            _request_lock.release()
 
-    return StreamingResponse(
+    return _InferenceStreamingResponse(
         body(),
+        cleanup,
         media_type="audio/pcm",
         headers={
             "X-Sample-Rate": str(app.state.runtime.sample_rate),
