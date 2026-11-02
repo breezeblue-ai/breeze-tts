@@ -203,6 +203,23 @@ The response body is the mono 24 kHz s16le PCM of every segment concatenated in 
 
 `frame_rate` is the codec frame rate (tokens per second of audio), useful for sizing `max_new_tokens`. `model_digest` is a SHA-256 over the checkpoint config, safetensors index (if present), and all referenced model weight files. It is computed once at startup using bounded-memory reads, distinguishes changed weights, and is independent of the checkpoint directory.
 
+### Direct model generation
+
+When calling `model.generate()` with inputs from `prepare_inputs()`, pass the bundled `audio_tokenizer` returned by `load_runtime()` to decode audio:
+
+```python
+audio = model.generate(
+    **inputs,
+    output_audio=True,
+    audio_tokenizer=audio_tokenizer,
+    repetition_penalty=1.1,
+)
+```
+
+`repetition_penalty` can also be set in `GenerationConfig`; it penalizes generated first-codebook audio tokens, not the text prompt. An explicit `GeneratedTokenRepetitionPenaltyLogitsProcessor` remains supported. If both forms enable a penalty, equal values are applied once; conflicting values raise an error.
+
+`output_audio=True` requires `audio_tokenizer`; omitting it raises an error before sampling. Use `output_audio=False` to obtain codec tokens without a decoder. Hugging Face generation options are not all compatible with Breeze's mixed text/audio history: `no_repeat_ngram_size` and `encoder_no_repeat_ngram_size` are unsupported and must remain `0`. Repetition penalty discourages repeated audio tokens; it does not guarantee that spoken phrases never repeat.
+
 ### ⚡ Fast Inference Options
 
 Both the CLI and API use eager streaming by default and skip graph warmup. Pass `--fast-all` to enable the best configuration for every inference stage when the additional cold-start time is acceptable. Each stage can also be controlled independently:
