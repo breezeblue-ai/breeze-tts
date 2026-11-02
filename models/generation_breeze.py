@@ -25,7 +25,12 @@ from transformers.generation import (
     GenerationMixin,
     GenerationMode,
 )
-from transformers.generation.logits_process import LogitsProcessorList
+from transformers.generation.logits_process import (
+    EncoderNoRepeatNGramLogitsProcessor,
+    LogitsProcessorList,
+    NoRepeatNGramLogitsProcessor,
+    RepetitionPenaltyLogitsProcessor,
+)
 from transformers.generation.stopping_criteria import (
     MaxLengthCriteria,
     StoppingCriteriaList,
@@ -33,7 +38,10 @@ from transformers.generation.stopping_criteria import (
 from transformers.generation.utils import GenerateNonBeamOutput
 from transformers.utils import logging
 
-from .logits_process import mask_invalid_codec_token_logits
+from .logits_process import (
+    GeneratedTokenRepetitionPenaltyLogitsProcessor,
+    mask_invalid_codec_token_logits,
+)
 
 if TYPE_CHECKING:
     from transformers.generation.streamers import BaseStreamer
@@ -441,6 +449,47 @@ class BreezeGenerationMixin(GenerationMixin):
         generation_config.get_generation_mode = patched_get_generation_mode
 
         return generation_config, model_kwargs
+
+    def _get_logits_processor(
+        self, generation_config: GenerationConfig, *args: Any, **kwargs: Any
+    ) -> LogitsProcessorList:
+        # HF's n-gram processors assume a 2D history in a single vocabulary.
+        # Breeze replaces text prompt IDs with 3D codec frames during sampling.
+        for name in ("no_repeat_ngram_size", "encoder_no_repeat_ngram_size"):
+            if getattr(generation_config, name, 0):
+                raise ValueError(
+                    f"{name} is not supported for Breeze audio generation. "
+                    "Leave it at 0; use repetition_penalty to discourage repeated "
+                    "generated audio tokens instead."
+                )
+
+        processors = super()._get_logits_processor(generation_config, *args, **kwargs)
+        adapted = LogitsProcessorList()
+        repetition = None
+        for processor in processors:
+            if isinstance(
+                processor,
+                (NoRepeatNGramLogitsProcessor, EncoderNoRepeatNGramLogitsProcessor),
+            ):
+                raise ValueError(
+                    "N-gram blocking processors are not supported for Breeze audio "
+                    "generation; use repetition_penalty instead."
+                )
+            if isinstance(processor, RepetitionPenaltyLogitsProcessor):
+                processor = GeneratedTokenRepetitionPenaltyLogitsProcessor(
+                    processor.penalty
+                )
+            if isinstance(processor, GeneratedTokenRepetitionPenaltyLogitsProcessor):
+                if repetition is not None:
+                    if processor.penalty != repetition.penalty:
+                        raise ValueError(
+                            "Conflicting repetition penalties: use one value for "
+                            "repetition_penalty and the custom audio logits processor."
+                        )
+                    continue
+                repetition = processor
+            adapted.append(processor)
+        return adapted
 
     def _sample(
         self,
@@ -1112,7 +1161,12 @@ class BreezeGenerationMixin(GenerationMixin):
 
         Most generation-controlling parameters are set in `generation_config` which, if not passed, will be set to the
         model's default generation configuration. You can override any `generation_config` by passing the corresponding
-        parameters to generate(), e.g. `.generate(inputs, do_sample=True)`.
+        supported parameters to generate(), e.g. `.generate(inputs, do_sample=True)`.
+        `repetition_penalty` applies only to generated first-codebook audio tokens,
+        never to text prompt IDs. N-gram blocking (`no_repeat_ngram_size` and
+        `encoder_no_repeat_ngram_size`) is not supported; leave these at 0.
+        Other Hugging Face generation options are not automatically compatible
+        with Breeze's mixed text/audio token history.
         </Tip>
 
         Parameters:
@@ -1152,6 +1206,9 @@ class BreezeGenerationMixin(GenerationMixin):
                 through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
             output_audio (`bool`, *optional*):
                 Whether to return the generated audio.
+            audio_tokenizer (*required when output_audio=True*):
+                The bundled Qwen audio tokenizer returned by `load_runtime()`.
+                Omit it only for code-only generation (`output_audio=False`).
             kwargs (`dict[str, Any]`, *optional*):
                 Ad hoc parametrization of `generation_config` and/or additional model-specific kwargs that will be
                 forwarded to the `forward` function of the model. Depth decoder specific kwargs should be prefixed with *depth_decoder_*.
@@ -1161,46 +1218,19 @@ class BreezeGenerationMixin(GenerationMixin):
             (if `return_dict_in_generate=True` or when `config.return_dict_in_generate=True`) or a `torch.LongTensor` when `output_audio=False`
             or a `list[torch.FloatTensor]` otherwise.
 
-        Example:
+        Example (with model, inputs and audio_tokenizer prepared by the runtime):
 
-        ```python
-        >>> from models.breeze import BreezeForConditionalGeneration
-        from transformers import AutoTokenizer
-        >>> from datasets import load_dataset, Audio
-
-        >>> model_id = "/path/to/breeze-model"
-        >>> torch_device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        >>> processor = AutoProcessor.from_pretrained(model_id)
-
-        >>> ds = load_dataset("hf-internal-testing/dailytalk-dummy", split="train")
-        >>> # ensure the audio is 24kHz
-        >>> ds = ds.cast_column("audio", Audio(sampling_rate=24000))
-
-        >>> conversation = []
-        >>> # prepare a conversation with text and corresponding audio
-        >>> for text, audio, speaker_id in zip(ds[:4]["text"], ds[:4]["audio"], ds[:4]["speaker_id"]):
-        ...     conversation.append(
-        ...         {
-        ...             "role": f"{speaker_id}",
-        ...             "content": [{"type": "text", "text": text}, {"type": "audio", "path": audio["array"]}],
-        ...         }
-        ...     )
-
-        >>> # text prompt
-        >>> conversation.append({"role": f"{ds[4]['speaker_id']}", "content": [{"type": "text", "text": ds[4]["text"]}]})
-
-        >>> inputs = processor.apply_chat_template(
-        ...     conversation,
-        ...     tokenize=True,
-        ...     return_dict=True,
-        ... ).to(torch_device)
-
-        >>> model = BreezeForConditionalGeneration.from_pretrained(model_id, device_map=torch_device)
-        >>> audio = model.generate(**inputs, output_audio=True)
-        >>> processor.save_audio(audio, "output.wav")
-        ```
+        >>> audio = model.generate(
+        ...     **inputs, output_audio=True, audio_tokenizer=audio_tokenizer,
+        ...     repetition_penalty=1.1,
+        ... )
         """
+        if output_audio and audio_tokenizer is None:
+            raise ValueError(
+                "audio_tokenizer is required when output_audio=True for Breeze. "
+                "Pass the audio_tokenizer returned by breeze_infer.runtime.load_runtime(), "
+                "or set output_audio=False to return codec tokens without decoding."
+            )
         generate_output = super().generate(
             input_ids=input_ids,
             input_values=input_values,
@@ -1275,20 +1305,10 @@ class BreezeGenerationMixin(GenerationMixin):
                         logger.warning(
                             "No codebook tokens were generated, generating silent audio."
                         )
-                        if audio_tokenizer is not None:
-                            codec_decode_output = audio_tokenizer.decode(
-                                {"audio_codes": dummy_codes}
-                            )
-                            decode_audio = _extract_decoded_audio_tensor(
-                                codec_decode_output
-                            )
-                        else:
-                            codec_decode_output = self.codec_model.decode(
-                                dummy_codes.transpose(0, 1).unsqueeze(0)
-                            )
-                            decode_audio = _extract_decoded_audio_tensor(
-                                codec_decode_output
-                            )
+                        codec_decode_output = audio_tokenizer.decode(
+                            {"audio_codes": dummy_codes}
+                        )
+                        decode_audio = _extract_decoded_audio_tensor(codec_decode_output)
                     else:
                         codebook_size = int(self.config.codec_config.codebook_size)
                         invalid_codes = (audio_codes_batch < 0) | (
@@ -1308,33 +1328,10 @@ class BreezeGenerationMixin(GenerationMixin):
                                 f"valid=[0, {codebook_size - 1}]"
                             )
 
-                        if (
-                            audio_tokenizer is None
-                        ):  # 兼容qwen3, 因为qwen3 tokenizer没有cardinality属性
-                            if (
-                                audio_codes_batch.max().item()
-                                >= self.codec_model.quantizer.cardinality
-                            ):
-                                audio_codes_batch = torch.clamp(
-                                    audio_codes_batch,
-                                    0,
-                                    self.codec_model.quantizer.cardinality - 1,
-                                )
-
-                        if audio_tokenizer is not None:
-                            codec_decode_output = audio_tokenizer.decode(
-                                {"audio_codes": [audio_codes_batch]}
-                            )
-                            decode_audio = _extract_decoded_audio_tensor(
-                                codec_decode_output
-                            )
-                        else:
-                            codec_decode_output = self.codec_model.decode(
-                                audio_codes_batch.transpose(0, 1).unsqueeze(0)
-                            )
-                            decode_audio = _extract_decoded_audio_tensor(
-                                codec_decode_output
-                            )
+                        codec_decode_output = audio_tokenizer.decode(
+                            {"audio_codes": [audio_codes_batch]}
+                        )
+                        decode_audio = _extract_decoded_audio_tensor(codec_decode_output)
 
                         codes_min_max = (
                             audio_codes_batch.min().item(),
