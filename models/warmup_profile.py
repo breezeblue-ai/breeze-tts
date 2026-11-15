@@ -209,13 +209,17 @@ def parse_warmup_profile(
         )
 
     depth_batches = tuple(
-        _positive_int(graph.get("batch_size"), "depth_decoder.batch_size")
-        for graph in _graphs(stages, "depth_decoder")
+        sorted(
+            {
+                _positive_int(graph.get("batch_size"), "depth_decoder.batch_size")
+                for graph in _graphs(stages, "depth_decoder")
+            }
+        )
     )
-    if tuple(sorted(set(depth_batches))) != expected_branch_batches:
+    if depth_batches != expected_branch_batches:
         raise ValueError(
             "depth_decoder batch sizes must match cfg_scales; "
-            f"expected {expected_branch_batches}"
+            f"expected {expected_branch_batches}, got {depth_batches}"
         )
 
     codec_graphs = _graphs(stages, "codec")
