@@ -371,6 +371,10 @@ async def speech(
             _request_lock.release()
 
     try:
+        if not text.strip():
+            raise HTTPException(
+                status_code=400, detail="text must be a non-empty string."
+            )
         if not np.isfinite(cfg_scale) or cfg_scale <= 0:
             raise HTTPException(
                 status_code=400, detail="cfg_scale must be greater than 0."
