@@ -85,3 +85,28 @@ def test_config_requires_synthetic_request() -> None:
 
     with pytest.raises(ValueError, match="warmup_request"):
         parse_warmup_profile(payload)
+
+
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [
+        ([1, 2], (1, 2)),
+        ([2, 1], (1, 2)),
+        ([1, 2, 1], (1, 2)),
+        ([2, 2, 1, 1], (1, 2)),
+    ],
+)
+def test_depth_decoder_batches_are_normalized(
+    declared: list[int], expected: tuple[int, ...]
+) -> None:
+    payload = _payload()
+    payload["stages"]["depth_decoder"]["graphs"] = [
+        {"batch_size": value} for value in declared
+    ]
+
+    profile = parse_warmup_profile(payload)
+
+    assert profile.depth_decoder_batch_sizes == expected
+    assert profile.to_dict()["stages"]["depth_decoder"]["graphs"] == [
+        {"batch_size": value} for value in expected
+    ]
