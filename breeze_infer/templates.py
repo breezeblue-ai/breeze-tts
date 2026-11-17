@@ -134,7 +134,9 @@ TEMPLATES: dict[str, TemplateSpec] = {
 
 def select_template_name(request: Request) -> str:
     has_ref_audio = bool(request.get("ref_audio_path"))
-    has_ref_text = bool(request.get("ref_text"))
+    has_ref_text = bool(
+        isinstance(request.get("ref_text"), str) and request["ref_text"].strip()
+    )
     if has_ref_audio != has_ref_text:
         raise ValueError("ref_audio_path and ref_text must be provided together")
     has_reference = has_ref_audio
